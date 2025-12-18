@@ -21,26 +21,26 @@
    - Automatic expiration (TTL)
    - Fast and inexpensive (suitable for frequently changing data, such as carts)
 
-Key in Redis:
+Redis key structue:
 
 ```
-cart:{user_id}
-```
+# Cart data
+cart:{user_id} → Hash of cart items
+  - TTL: 30 days
+  - Value: {"product_id": {"qty": 2, "price_snapshot": 15000, "added_at": timestamp}}
 
-Value:
+# Locks
+lock:cart:{user_id}:{product_id} → "locked"
+  - TTL: 60 seconds
+  - Value: timestamp of lock creation
 
-```
-{
-  "product_id_1": {
-    "qty": 2,
-    "price_snapshot": 15000
-  },
-  "product_id_2": {
-    "qty": 1,
-    "price_snapshot": 50000
-  }
-}
+lock:product:{product_id} → "locked"
+  - TTL: 60 seconds
+  - Used during add/update to prevent overselling
 
+lock:checkout:{user_id} → "locked"
+  - TTL: 120 seconds
+  - Longer TTL for checkout process
 ```
 
 2. PostgreSQL
@@ -144,36 +144,55 @@ flowchart TD
     Start@{ shape: circle, label: "Start" }
     Stop@{ shape: dbl-circ, label: "Stop" }
 
-    Add@{ shape: lean-r, label: "User add product to cart" }
-    Send@{ shape: rect, label: "Frontend send product_id and quantity" }
+    UserAdd@{ shape: lean-r, label: "User add product to cart" }
 
-    Receive@{ shape: rect, label: "Backend receives request" }
-    Get@{ shape: rect, label: "Get data product from database" }
+    TryLockProduct@{ shape: rect, label: "Try acquire lock:product:{product_id}<br/>TTL 60s" }
+    LockProductOK@{ shape: diamond, label: "Lock acquired?" }
+    RetryWait@{ shape: rect, label: "Wait 100ms & retry<br/>(max 3x)" }
+    ErrorLocked@{ shape: lean-r, label: "Product temporarily locked" }
 
-    Check@{ shape: diamond, label: "product && quantity > 0 && quantity <= stock" }
+    GetProduct@{ shape: rect, label: "Get product from DB<br/>(price, stock)" }
+    ValidateStock@{ shape: diamond, label: "quantity > 0 &&<br/>quantity <= stock" }
+    ErrorStock@{ shape: lean-r, label: "Insufficient stock" }
 
-    Error@{ shape: lean-r, label: "Validasi Error" }
-    GetDataFromRedis@{ shape: rect, label: "Get data cart from redis by user id" }
+    TryLockCart@{ shape: rect, label: "Try acquire lock:cart:{user_id}:{product_id}<br/>TTL 60s" }
+    LockCartOK@{ shape: diamond, label: "Lock acquired?" }
 
-    CheckCart@{ shape: diamond, label: "Cart != null" }
+    GetCart@{ shape: rect, label: "Get cart from Redis" }
+    CheckExisting@{ shape: diamond, label: "Product exists<br/>in cart?" }
 
-    CreateNewCart@{ shape: rect, label: "Create new cart" }
-    UpdateQtyCart@{ shape: rect, label: "Update quantity cart" }
+    CalcNewQty@{ shape: rect, label: "Calculate new quantity" }
+    ValidateNewQty@{ shape: diamond, label: "new_qty <= stock" }
 
-    SavePriceSnapshot@{ shape: rect, label: "Save price snapshot" }
+    AddNewItem@{ shape: rect, label: "Add new item to cart" }
+    UpdateQty@{ shape: rect, label: "Update quantity" }
 
-    ReturnCart@{ shape: lean-r, label: "Return data cart to user" }
+    SaveSnapshot@{ shape: rect, label: "Save price_snapshot" }
+    SaveRedis@{ shape: rect, label: "HSET cart:{user_id}<br/>EXPIRE 30 days" }
 
-    Start --> Add --> Send--> Receive --> Get --> Check
+    ReleaseLocks@{ shape: rect, label: "Release all locks<br/>(cart + product)" }
 
-    Check-- false --> Error --> Stop
-    Check-- true --> GetDataFromRedis --> CheckCart
+    Start --> UserAdd --> TryLockProduct --> LockProductOK
 
-    CheckCart -- false --> CreateNewCart --> SavePriceSnapshot
-    CheckCart -- true --> UpdateQtyCart --> ReturnCart
+    LockProductOK -- false --> RetryWait
+    RetryWait -- Max retries --> ErrorLocked --> Stop
+    RetryWait -- Retry --> TryLockProduct
 
-    SavePriceSnapshot --> ReturnCart --> Stop
+    LockProductOK -- true --> GetProduct --> ValidateStock
 
+    ValidateStock -- false --> ErrorStock
+    ValidateStock -- true --> TryLockCart --> LockCartOK
+
+    LockCartOK -- false --> RetryWait
+    LockCartOK -- true --> GetCart --> CheckExisting
+
+    CheckExisting -- true --> CalcNewQty --> ValidateNewQty
+    CheckExisting -- false --> AddNewItem --> SaveSnapshot
+
+    ValidateNewQty -- false --> ErrorStock --> ReleaseLocks
+    ValidateNewQty -- true --> UpdateQty --> SaveRedis
+
+    SaveSnapshot --> SaveRedis --> ReleaseLocks --> Stop
 ```
 
 ## Update Quantity
