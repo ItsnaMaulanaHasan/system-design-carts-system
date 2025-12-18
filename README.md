@@ -1,5 +1,74 @@
 # System Design Cart System
 
+## Requirements
+
+- Add prouduct to cart
+- Remove product from cart
+- Update quantity
+- Remove cart/Checkout
+- Consistent/Multi device (accross sessions) per account
+- Race condition (only 1 cart can be checkout)
+- 1 day 1 million data add to cart
+- Expired cart 1 month
+- Data integrity (no price manipulation, and parameter tampering)
+- Validation stock when checkout
+
+## Storage Type Selection Strategy
+
+1. Redis
+
+   - To store active cart data
+   - Automatic expiration (TTL)
+   - Fast and inexpensive (suitable for frequently changing data, such as carts)
+
+Key in Redis:
+
+```
+cart:{user_id}
+```
+
+Value:
+
+```
+{
+  "product_id_1": {
+    "qty": 2,
+    "price_snapshot": 15000
+  },
+  "product_id_2": {
+    "qty": 1,
+    "price_snapshot": 50000
+  }
+}
+
+```
+
+2. PostgreSQL
+   - Stores product data (name, price, stock, etc.)
+   - Order data after checkout
+   - PostgreSQL is an RDBMS that can maintain data consistency and data integrity.
+
+## Architecture Diagram
+
+```mermaid
+flowchart LR
+    U[User<br/>Web / Mobile] -->|HTTPS + JWT| FE[Frontend App]
+
+    FE -->|API Request| LB[API Gateway / Load Balancer]
+
+    LB --> BE["Backend Application<br/>(Cart & Order Module)"]
+
+    BE -->|Get / Update Cart| R[(Redis<br/>Cart State + TTL)]
+
+    BE -->|Read / Write| DB[(PostgreSQL<br/>Products, Orders)]
+
+    subgraph Data Layer
+        R
+        DB
+    end
+
+```
+
 ## ERD
 
 ```mermaid
@@ -23,27 +92,11 @@ erDiagram
         timestamp updated_at
     }
 
-    CARTS {
-        uuid id PK
-        uuid user_id FK
-        varchar status
-        timestamp expired_at
-        timestamp created_at
-    }
-
-    CART_ITEMS {
-        bigint id PK
-        uuid cart_id FK
-        uuid product_id FK
-        int quantity "quantity > 0"
-        numeric price_snapshot ">= 0"
-    }
-
     ORDERS {
         uuid id PK
         uuid user_id FK
         varchar status
-        numeric total_amount ">= 0"
+        numeric total_amount "total_amount >= 0"
         timestamp created_at
     }
 
@@ -52,13 +105,9 @@ erDiagram
         uuid order_id FK
         uuid product_id FK
         int quantity "quantity > 0"
-        numeric price_snapshot ">= 0"
-        numeric subtotal_snapshot ">= 0"
+        numeric price_snapshot " price_snapshot >= 0"
+        numeric subtotal_snapshot "subtotal_snapshot >= 0"
     }
-
-    USERS ||--o{ CARTS : owns
-    CARTS ||--o{ CART_ITEMS : contains
-    PRODUCTS ||--o{ CART_ITEMS : referenced_by
 
     USERS ||--o{ ORDERS : places
     ORDERS ||--o{ ORDER_ITEMS : has
@@ -91,7 +140,6 @@ flowchart TD
     UpdateQtyCart@{ shape: rect, label: "Update quantity cart" }
 
     SavePriceSnapshot@{ shape: rect, label: "Save price snapshot" }
-    CalculateTotal@{ shape: rect, label: "Calculate subtotal cart" }
 
     ReturnCart@{ shape: lean-r, label: "Return data cart to user" }
 
@@ -101,9 +149,9 @@ flowchart TD
     Check-- true --> GetDataFromRedis --> CheckCart
 
     CheckCart -- false --> CreateNewCart --> SavePriceSnapshot
-    CheckCart -- true --> UpdateQtyCart --> SavePriceSnapshot
+    CheckCart -- true --> UpdateQtyCart --> ReturnCart
 
-    SavePriceSnapshot --> CalculateTotal --> ReturnCart --> Stop
+    SavePriceSnapshot --> ReturnCart --> Stop
 
 ```
 
@@ -119,7 +167,6 @@ flowchart TD
 
     CheckStock@{ shape: diamond, label: "New quantity <= stock" }
     ReturnError@{ shape: lean-r, label: "Validasi Error" }
-    InvalidateRedis@{ shape: rect, label: "Invalidate cache data cart on Redis" }
     UpdateCart@{ shape: rect, label: "Update data cart" }
     SaveToRedis@{ shape: rect, label: "Save new data cart to Redis" }
     ReturnNewCart@{ shape: rect, label: "Return new cart with new quantity" }
@@ -127,7 +174,7 @@ flowchart TD
     Start --> UserUpdate --> BackendGet --> CheckStock
 
     CheckStock -- false --> ReturnError --> Stop
-    CheckStock -- true --> InvalidateRedis --> UpdateCart --> SaveToRedis --> ReturnNewCart --> Stop
+    CheckStock -- true --> UpdateCart --> SaveToRedis --> ReturnNewCart --> Stop
 ```
 
 ## Checkout
@@ -137,26 +184,128 @@ flowchart TD
     Start@{ shape: circle, label: "Start" }
     Stop@{ shape: dbl-circ, label: "Stop" }
 
-    UserCheckout@{ shape: lean-r, label: "User checkout carts" }
-    BackendGet@{ shape: rect, label: "Backend get data carts from redis" }
+    UserCheckout@{ shape: lean-r, label: "User checkout cart" }
+    AcquireLock@{ shape: rect, label: "Acquire Redis checkout lock" }
 
-    CheckCart@{ shape: diamond, label: "cart != null" }
-    ReturnError@{ shape: lean-r, label: "Validasi Error" }
-    BeginTransaction@{ shape: rect, label: "Begin database transaction" }
-    GetAllCart@{ shape: rect, label: "Get all cart items" }
-    CheckStock@{ shape: rect, label: "Validate stock each cart items" }
+    LockCheck@{ shape: diamond, label: "Lock acquired?" }
+    ReturnLocked@{ shape: lean-r, label: "Checkout in progress" }
 
-    Rollback@{ shape: rect, label: "Rollback database transaction" }
-    InsertOrder@{ shape: rect, label: "Inser data order" }
-    Commit@{ shape: rect, label: "Commit database transaction"}
-    DeleteRedis@{ shape: rect, label: "Delete data cart on redis" }
+    GetCart@{ shape: rect, label: "Get cart from Redis" }
+    CartCheck@{ shape: diamond, label: "Cart != null" }
+
+    BeginTX@{ shape: rect, label: "Begin DB transaction" }
+    GetItems@{ shape: rect, label: "Get cart items" }
+
+    StockCheck@{ shape: diamond, label: "Stock sufficient?" }
+
+    Rollback@{ shape: rect, label: "Rollback transaction" }
+    InsertOrder@{ shape: rect, label: "Insert order & order_items" }
+    UpdateStock@{ shape: rect, label: "Update product stock" }
+    Commit@{ shape: rect, label: "Commit transaction" }
+
+    DeleteCart@{ shape: rect, label: "Delete cart from Redis" }
+    ReleaseLock@{ shape: rect, label: "Release Redis lock" }
+
     ReturnSuccess@{ shape: lean-r, label: "Return checkout success" }
 
-    Start --> UserCheckout --> BackendGet --> CheckCart
+    Start --> UserCheckout --> AcquireLock --> LockCheck
 
-    CheckCart -- false --> ReturnError --> Stop
-    CheckCart -- true --> BeginTransaction --> GetAllCart --> CheckStock
+    LockCheck -- false --> ReturnLocked --> Stop
+    LockCheck -- true --> GetCart --> CartCheck
 
-    CheckStock -- false --> Rollback --> Stop
-    CheckStock -- true --> InsertOrder --> IncreaseStock --> Commit --> DeleteRedis --> ReturnSuccess --> Stop
+    CartCheck -- false --> ReleaseLock
+
+    CartCheck -- true --> BeginTX --> GetItems --> StockCheck
+
+    StockCheck -- false --> Rollback --> ReleaseLock
+    StockCheck -- true --> InsertOrder --> UpdateStock --> Commit --> DeleteCart --> ReleaseLock --> ReturnSuccess --> Stop
+
+```
+
+# Sequence Diagram
+
+## Add and Update Cart
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant FE as Frontend
+    participant BE as Backend API
+    participant DB as PostgreSQL
+    participant R as Redis
+
+    User ->> FE: Click Add / Update Cart
+    FE ->> BE: POST /cart/items (product_id, qty)
+
+    BE ->> DB: Get product (price, stock)
+    DB -->> BE: Product data
+
+    BE ->> BE: Validate qty <= stock
+
+    BE ->> R: GET cart:{user_id}
+    R -->> BE: Cart data (if exists)
+
+    BE ->> R: Update qty + price_snapshot
+    BE ->> R: EXPIRE cart:{user_id} (30 days)
+
+    BE -->> FE: Return updated cart
+    FE -->> User: Render cart
+
+```
+
+## Checkout
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant FE as Frontend
+    participant BE as Backend API
+    participant R as Redis
+    participant DB as PostgreSQL
+
+    User ->> FE: Click Checkout
+    FE ->> BE: POST /checkout
+
+    BE ->> R: SETNX checkout_lock:{user_id}
+    alt Lock exists
+        R -->> BE: FAIL
+        BE -->> FE: Checkout in progress
+    else Lock acquired
+        R -->> BE: OK
+
+        BE ->> R: GET cart:{user_id}
+        R -->> BE: Cart data
+
+        BE ->> DB: BEGIN TRANSACTION
+        BE ->> DB: SELECT products FOR UPDATE
+        DB -->> BE: Locked rows
+
+        BE ->> BE: Validate stock
+
+        BE ->> DB: INSERT orders
+        BE ->> DB: INSERT order_items
+        BE ->> DB: UPDATE products.stock
+        BE ->> DB: COMMIT
+
+        BE ->> R: DEL cart:{user_id}
+        BE ->> R: DEL checkout_lock:{user_id}
+
+        BE -->> FE: Checkout success
+    end
+
+```
+
+## Checkout (Failed)
+
+```mermaid
+sequenceDiagram
+    participant BE as Backend API
+    participant DB as PostgreSQL
+
+    BE ->> DB: SELECT products FOR UPDATE
+    DB -->> BE: Stock insufficient
+
+    BE ->> DB: ROLLBACK
+    BE -->> BE: Return error (out of stock)
+
 ```
