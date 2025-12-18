@@ -52,15 +52,16 @@ Value:
 
 ```mermaid
 flowchart LR
-    U[User<br/>Web / Mobile] -->|HTTPS + JWT| FE[Frontend App]
+    User@{ shape: rect, label: User<br/>Web / Mobile }
+    FE@{ shape: rect, label: Frontend App }
+    LB@{ shape: rect, label: API Gateaway / Load Balancer }
+    BE@{ shape: rect, label: "Backend Application<br/>(Cart & Order Module)" }
 
-    FE -->|API Request| LB[API Gateway / Load Balancer]
+    R@{ shape: cyl, label: Redis<br/>Cart State + TTL }
+    DB@{ shape: cyl, label: "PostgreSQL<br/>Products, Orders, Carts" }
 
-    LB --> BE["Backend Application<br/>(Cart & Order Module)"]
-
-    BE -->|Get / Update Cart| R[(Redis<br/>Cart State + TTL)]
-
-    BE -->|Read / Write| DB[(PostgreSQL<br/>Products, Orders)]
+    User -- HTTPS + JWT --> FE -- API Request --> LB --> BE -- Get / Update Cart --> R
+    BE -- Read, Write, Backup carts --> DB
 
     subgraph Data Layer
         R
