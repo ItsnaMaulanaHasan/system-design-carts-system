@@ -203,18 +203,28 @@ flowchart TD
     Stop@{ shape: dbl-circ, label: "Stop" }
 
     UserUpdate@{ shape: lean-r, label: "User update quantity" }
-    BackendGet@{ shape: rect, label: "Backend get data product from database" }
 
-    CheckStock@{ shape: diamond, label: "New quantity <= stock" }
-    ReturnError@{ shape: lean-r, label: "Validasi Error" }
-    UpdateCart@{ shape: rect, label: "Update data cart" }
-    SaveToRedis@{ shape: rect, label: "Save new data cart to Redis" }
-    ReturnNewCart@{ shape: rect, label: "Return new cart with new quantity" }
+    TryLockProduct@{ shape: rect, label: "Acquire lock:product:{product_id}<br/>TTL 60s" }
+    TryLockCart@{ shape: rect, label: "Acquire lock:cart:{user_id}:{product_id}<br/>TTL 60s" }
 
-    Start --> UserUpdate --> BackendGet --> CheckStock
+    LockOK@{ shape: diamond, label: "Both locks<br/>acquired?" }
+    ErrorLock@{ shape: lean-r, label: "Unable to acquire lock" }
 
-    CheckStock -- false --> ReturnError --> Stop
-    CheckStock -- true --> UpdateCart --> SaveToRedis --> ReturnNewCart --> Stop
+    GetProduct@{ shape: rect, label: "Get product from DB" }
+    ValidateStock@{ shape: diamond, label: "new_qty > 0 &&<br/>new_qty <= stock" }
+
+    ErrorStock@{ shape: lean-r, label: "Invalid quantity" }
+
+    UpdateCart@{ shape: rect, label: "Update cart in Redis<br/>HSET cart:{user_id}" }
+    ReleaseLocks@{ shape: rect, label: "Release locks" }
+
+    Start --> UserUpdate --> TryLockProduct --> TryLockCart --> LockOK
+
+    LockOK -- false --> ErrorLock --> Stop
+    LockOK -- true --> GetProduct --> ValidateStock
+
+    ValidateStock -- false --> ErrorStock --> ReleaseLocks
+    ValidateStock -- true --> UpdateCart --> ReleaseLocks --> Stop
 ```
 
 ## Checkout
