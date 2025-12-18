@@ -171,6 +171,7 @@ flowchart TD
     SaveRedis@{ shape: rect, label: "HSET cart:{user_id}<br/>EXPIRE 30 days" }
 
     ReleaseLocks@{ shape: rect, label: "Release all locks<br/>(cart + product)" }
+    Success@{ shape: lean-r, label: "Return updated cart" }
 
     Start --> UserAdd --> TryLockProduct --> LockProductOK
 
@@ -192,7 +193,7 @@ flowchart TD
     ValidateNewQty -- false --> ErrorStock --> ReleaseLocks
     ValidateNewQty -- true --> UpdateQty --> SaveRedis
 
-    SaveSnapshot --> SaveRedis --> ReleaseLocks --> Stop
+    SaveSnapshot --> SaveRedis --> Success --> ReleaseLocks --> Stop
 ```
 
 ## Update Quantity
@@ -217,6 +218,7 @@ flowchart TD
 
     UpdateCart@{ shape: rect, label: "Update cart in Redis<br/>HSET cart:{user_id}" }
     ReleaseLocks@{ shape: rect, label: "Release locks" }
+    Success@{ shape: lean-r, label: "Return updated cart" }
 
     Start --> UserUpdate --> TryLockProduct --> TryLockCart --> LockOK
 
@@ -224,7 +226,7 @@ flowchart TD
     LockOK -- true --> GetProduct --> ValidateStock
 
     ValidateStock -- false --> ErrorStock --> ReleaseLocks
-    ValidateStock -- true --> UpdateCart --> ReleaseLocks --> Stop
+    ValidateStock -- true --> UpdateCart --> Success --> ReleaseLocks --> Stop
 ```
 
 ## Checkout
@@ -234,42 +236,53 @@ flowchart TD
     Start@{ shape: circle, label: "Start" }
     Stop@{ shape: dbl-circ, label: "Stop" }
 
-    UserCheckout@{ shape: lean-r, label: "User checkout cart" }
-    AcquireLock@{ shape: rect, label: "Acquire Redis checkout lock" }
+    UserCheckout@{ shape: lean-r, label: "User checkout" }
 
-    LockCheck@{ shape: diamond, label: "Lock acquired?" }
-    ReturnLocked@{ shape: lean-r, label: "Checkout in progress" }
+    AcquireLock@{ shape: rect, label: "Acquire lock:checkout:{user_id}<br/>TTL 120s" }
+    LockOK@{ shape: diamond, label: "Lock acquired?" }
+    ErrorLock@{ shape: lean-r, label: "Checkout in progress" }
 
     GetCart@{ shape: rect, label: "Get cart from Redis" }
-    CartCheck@{ shape: diamond, label: "Cart != null" }
+    CartEmpty@{ shape: diamond, label: "Cart exists?" }
+    ErrorEmpty@{ shape: lean-r, label: "Cart is empty" }
 
-    BeginTX@{ shape: rect, label: "Begin DB transaction" }
-    GetItems@{ shape: rect, label: "Get cart items" }
+    BeginTX@{ shape: rect, label: "BEGIN Transaction" }
+    LockProducts@{ shape: rect, label: "SELECT products FOR UPDATE<br/>(lock rows in DB)" }
 
-    StockCheck@{ shape: diamond, label: "Stock sufficient?" }
+    ValidateStock@{ shape: rect, label: "Check stock for each item" }
+    StockOK@{ shape: diamond, label: "Stock sufficient?" }
 
-    Rollback@{ shape: rect, label: "Rollback transaction" }
-    InsertOrder@{ shape: rect, label: "Insert order & order_items" }
+    ValidatePrice@{ shape: rect, label: "Compare price_snapshot<br/>with current price" }
+    PriceOK@{ shape: diamond, label: "Price unchanged?" }
+
+    NotifyPrice@{ shape: lean-r, label: "Notify price change<br/>Ask confirmation" }
+
+    CreateOrder@{ shape: rect, label: "Insert order & order_items" }
     UpdateStock@{ shape: rect, label: "Update product stock" }
-    Commit@{ shape: rect, label: "Commit transaction" }
+    Commit@{ shape: rect, label: "COMMIT" }
+
+    Rollback1@{ shape: rect, label: "ROLLBACK" }
+    Rollback2@{ shape: rect, label: "ROLLBACK" }
 
     DeleteCart@{ shape: rect, label: "Delete cart from Redis" }
-    ReleaseLock@{ shape: rect, label: "Release Redis lock" }
+    ReleaseLock@{ shape: rect, label: "Release checkout lock" }
 
-    ReturnSuccess@{ shape: lean-r, label: "Return checkout success" }
+    Success@{ shape: lean-r, label: "Return order confirmation" }
+    ErrorStock@{ shape: lean-r, label: "Stock insufficient" }
 
-    Start --> UserCheckout --> AcquireLock --> LockCheck
+    Start --> UserCheckout --> AcquireLock --> LockOK
 
-    LockCheck -- false --> ReturnLocked --> Stop
-    LockCheck -- true --> GetCart --> CartCheck
+    LockOK -- false --> ErrorLock --> Stop
+    LockOK -- true --> GetCart --> CartEmpty
 
-    CartCheck -- false --> ReleaseLock
+    CartEmpty -- false --> ErrorEmpty --> ReleaseLock
+    CartEmpty -- true --> BeginTX --> LockProducts --> ValidateStock --> StockOK
 
-    CartCheck -- true --> BeginTX --> GetItems --> StockCheck
+    StockOK -- false --> Rollback1 --> ErrorStock --> ReleaseLock
+    StockOK -- true --> ValidatePrice --> PriceOK
 
-    StockCheck -- false --> Rollback --> ReleaseLock
-    StockCheck -- true --> InsertOrder --> UpdateStock --> Commit --> DeleteCart --> ReleaseLock --> ReturnSuccess --> Stop
-
+    PriceOK -- false --> Rollback2 --> NotifyPrice --> ReleaseLock
+    PriceOK -- true --> CreateOrder --> UpdateStock --> Commit --> DeleteCart --> Success --> ReleaseLock --> Stop
 ```
 
 # Sequence Diagram
@@ -300,7 +313,6 @@ sequenceDiagram
 
     BE -->> FE: Return updated cart
     FE -->> User: Render cart
-
 ```
 
 ## Checkout
@@ -342,7 +354,6 @@ sequenceDiagram
 
         BE -->> FE: Checkout success
     end
-
 ```
 
 ## Checkout (Failed)
