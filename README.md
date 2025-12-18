@@ -92,6 +92,22 @@ erDiagram
         timestamp updated_at
     }
 
+    CARTS {
+        uuid id PK
+        uuid user_id FK
+        varchar status
+        timestamp expired_at
+        timestamp created_at
+    }
+
+    CART_ITEMS {
+        bigint id PK
+        uuid cart_id FK
+        uuid product_id FK
+        int quantity "quantity > 0"
+        numeric price_snapshot ">= 0"
+    }
+
     ORDERS {
         uuid id PK
         uuid user_id FK
@@ -108,6 +124,10 @@ erDiagram
         numeric price_snapshot " price_snapshot >= 0"
         numeric subtotal_snapshot "subtotal_snapshot >= 0"
     }
+
+    USERS ||--o{ CARTS : owns
+    CARTS ||--o{ CART_ITEMS : contains
+    PRODUCTS ||--o{ CART_ITEMS : referenced_by
 
     USERS ||--o{ ORDERS : places
     ORDERS ||--o{ ORDER_ITEMS : has
