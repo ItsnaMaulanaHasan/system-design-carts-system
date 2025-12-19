@@ -292,27 +292,47 @@ flowchart TD
 ```mermaid
 sequenceDiagram
     actor User
-    participant FE as Frontend
-    participant BE as Backend API
-    participant DB as PostgreSQL
+    participant BE as Backend
     participant R as Redis
+    participant DB as PostgreSQL
 
-    User ->> FE: Click Add / Update Cart
-    FE ->> BE: POST /cart/items (product_id, qty)
+    User ->> BE: POST /cart/items {product_id, qty}
 
-    BE ->> DB: Get product (price, stock)
-    DB -->> BE: Product data
+    Note over BE,R: Step 1: Acquire product lock
+    BE ->> R: SET lock:product:{id} "locked" EX 60 NX
 
-    BE ->> BE: Validate qty <= stock
+    alt Lock failed
+        R -->> BE: (nil)
+        BE ->> BE: Retry 3x with backoff
+        BE -->> User: 409 - Product busy, try again
+    else Lock acquired
+        R -->> BE: OK
 
-    BE ->> R: GET cart:{user_id}
-    R -->> BE: Cart data (if exists)
+        Note over BE,DB: Step 2: Validate stock
+        BE ->> DB: SELECT price, stock FROM products WHERE id = ?
+        DB -->> BE: {price: 15000, stock: 10}
 
-    BE ->> R: Update qty + price_snapshot
-    BE ->> R: EXPIRE cart:{user_id} (30 days)
+        alt Insufficient stock
+            BE ->> R: DEL lock:product:{id}
+            BE -->> User: 400 - Stock insufficient
+        else Stock OK
+            Note over BE,R: Step 3: Update cart
+            BE ->> R: SET lock:cart:{user}:{product} EX 60 NX
+            BE ->> R: HGET cart:{user_id}
+            R -->> BE: Existing cart data
 
-    BE -->> FE: Return updated cart
-    FE -->> User: Render cart
+            BE ->> BE: Calculate new quantity<br/>Validate new_qty <= stock
+
+            BE ->> R: HSET cart:{user_id} {product_id}<br/>{qty, price_snapshot, added_at}
+            BE ->> R: EXPIRE cart:{user_id} 30 days
+
+            Note over BE,R: Step 4: Release locks
+            BE ->> R: DEL lock:cart:{user}:{product}
+            BE ->> R: DEL lock:product:{id}
+
+            BE -->> User: 200 - Cart updated
+        end
+    end
 ```
 
 ## Checkout
@@ -320,39 +340,63 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     actor User
-    participant FE as Frontend
-    participant BE as Backend API
+    participant BE as Backend
     participant R as Redis
     participant DB as PostgreSQL
 
-    User ->> FE: Click Checkout
-    FE ->> BE: POST /checkout
+    User ->> BE: POST /checkout
 
-    BE ->> R: SETNX checkout_lock:{user_id}
-    alt Lock exists
-        R -->> BE: FAIL
-        BE -->> FE: Checkout in progress
+    Note over BE,R: Step 1: Acquire checkout lock
+    BE ->> R: SET lock:checkout:{user_id} EX 120 NX
+
+    alt Lock failed
+        R -->> BE: (nil)
+        BE -->> User: 409 - Checkout in progress
     else Lock acquired
         R -->> BE: OK
 
-        BE ->> R: GET cart:{user_id}
-        R -->> BE: Cart data
+        Note over BE,R: Step 2: Get cart
+        BE ->> R: HGETALL cart:{user_id}
+        R -->> BE: Cart items with price_snapshot
 
-        BE ->> DB: BEGIN TRANSACTION
-        BE ->> DB: SELECT products FOR UPDATE
-        DB -->> BE: Locked rows
+        alt Cart empty
+            BE ->> R: DEL lock:checkout:{user_id}
+            BE -->> User: 400 - Cart is empty
+        else Cart exists
+            Note over BE,DB: Step 3: Begin transaction
+            BE ->> DB: BEGIN
+            BE ->> DB: SELECT * FROM products<br/>WHERE id IN (...) FOR UPDATE
+            DB -->> BE: Products (rows locked)
 
-        BE ->> BE: Validate stock
+            Note over BE: Step 4: Validate
+            BE ->> BE: Check stock for each item
 
-        BE ->> DB: INSERT orders
-        BE ->> DB: INSERT order_items
-        BE ->> DB: UPDATE products.stock
-        BE ->> DB: COMMIT
+            alt Stock insufficient
+                BE ->> DB: ROLLBACK
+                BE ->> R: DEL lock:checkout:{user_id}
+                BE -->> User: 400 - Stock insufficient
+            else Stock OK
+                BE ->> BE: Compare price_snapshot vs current price
 
-        BE ->> R: DEL cart:{user_id}
-        BE ->> R: DEL checkout_lock:{user_id}
+                alt Price changed
+                    BE ->> DB: ROLLBACK
+                    BE ->> R: DEL lock:checkout:{user_id}
+                    BE -->> User: 409 - Price changed, review cart
+                else Price unchanged
+                    Note over BE,DB: Step 5: Create order
+                    BE ->> DB: INSERT INTO orders
+                    BE ->> DB: INSERT INTO order_items
+                    BE ->> DB: UPDATE products SET stock = stock - qty
+                    BE ->> DB: COMMIT
 
-        BE -->> FE: Checkout success
+                    Note over BE,R: Step 6: Cleanup
+                    BE ->> R: DEL cart:{user_id}
+                    BE ->> R: DEL lock:checkout:{user_id}
+
+                    BE -->> User: 200 - Order created successfully
+                end
+            end
+        end
     end
 ```
 
